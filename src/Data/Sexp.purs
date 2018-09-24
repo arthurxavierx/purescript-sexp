@@ -11,22 +11,22 @@ module Data.Sexp
 ( Sexp(..)
 , toString, fromString
 , class ToSexp, toSexp
+, class ToSexpRecord, toSexpRecord
 , class FromSexp, fromSexp
+, class FromSexpRecord, fromSexpRecord
 , class AsSexp
-, gToSexp, gFromSexp
 , class GenericToSexp, genericToSexp'
 , class GenericToSexpArgs, genericToSexpArgs'
-, class GenericToSexpFields, genericToSexpFields'
 , class GenericFromSexp, genericFromSexp'
 , class GenericFromSexpArgs, genericFromSexpArgs'
-, class GenericFromSexpFields, genericFromSexpFields'
 , genericToSexp, genericFromSexp
 ) where
+
+import Prelude
 
 import Control.Alt ((<|>))
 import Data.Either (Either(..))
 import Data.Foldable (foldMap)
-import Data.Generic (fromSpine, class Generic, GenericSpine(..), toSpine)
 import Data.Generic.Rep as Rep
 import Data.Int as Int
 import Data.List ((:), List(..))
@@ -36,24 +36,26 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Set as Set
-import Data.String as String
-import Data.StrMap (StrMap)
-import Data.StrMap as StrMap
+import Data.String.CodeUnits as String
 import Data.Symbol (class IsSymbol, reflectSymbol, SProxy(..))
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Global (readFloat)
 import Partial.Unsafe (unsafeCrashWith)
-import Prelude
+import Prim.Row as Row
+import Prim.RowList (class RowToList, Cons, Nil, kind RowList)
+import Record (delete, get)
+import Record.Builder (Builder)
+import Record.Builder (build, insert) as Builder
 import Test.QuickCheck.Arbitrary (class Arbitrary, arbitrary)
 import Test.QuickCheck.Gen as Gen
+import Type.Row (RLProxy(..))
 
 -- | S-expression.
 data Sexp = Atom String | List (List Sexp)
 
 derive instance eqSexp :: Eq Sexp
 derive instance ordSexp :: Ord Sexp
-derive instance genericSexp :: Generic Sexp
 derive instance genericRepSexp :: Rep.Generic Sexp _
 
 instance arbitrarySexp :: Arbitrary Sexp where
@@ -98,7 +100,7 @@ class ToSexp a where
   toSexp :: a -> Sexp
 
 instance toSexpSexp :: ToSexp Sexp where
-  toSexp = id
+  toSexp = identity
 
 instance toSexpVoid :: ToSexp Void where
   toSexp = absurd
@@ -121,6 +123,28 @@ instance toSexpNumber :: ToSexp Number where
 
 instance toSexpString :: ToSexp String where
   toSexp = Atom
+
+instance toSexpRecord_ :: (RowToList r rl, ToSexpRecord rl r) => ToSexp (Record r) where
+  toSexp = List <<< toSexpRecord (RLProxy :: RLProxy rl)
+
+class ToSexpRecord rl r | rl -> r where
+  toSexpRecord :: RLProxy rl -> Record r -> List Sexp
+
+instance toSexpRecordNil :: ToSexpRecord Nil () where
+  toSexpRecord _ _ = Nil
+
+instance toSexpRecordCons
+  :: ( IsSymbol l
+     , Row.Lacks l r_
+     , Row.Cons l a r_ r
+     , ToSexp a
+     , ToSexpRecord rl_ r_
+     )
+  => ToSexpRecord (Cons l a rl_) r where
+  toSexpRecord _ r = Atom (reflectSymbol l) : toSexp (get l r) : toSexpRecord rl_ (delete l r)
+    where
+      l = SProxy :: SProxy l
+      rl_ = RLProxy :: RLProxy rl_
 
 instance toSexpArray :: (ToSexp a) => ToSexp (Array a) where
   toSexp xs = List (List.fromFoldable (map toSexp xs))
@@ -148,21 +172,7 @@ instance toSexpSet :: (ToSexp a) => ToSexp (Set a) where
   toSexp xs = List (map toSexp (Set.toUnfoldable xs))
 
 instance toSexpMap :: (ToSexp k, ToSexp v) => ToSexp (Map k v) where
-  toSexp xs = List (Map.toList xs >>= \(Tuple k v) -> toSexp k : toSexp v : Nil)
-
-instance toSexpStrMap :: (ToSexp v) => ToSexp (StrMap v) where
-  toSexp xs = List (StrMap.toList xs >>= \(Tuple k v) -> Atom k : toSexp v : Nil)
-
-instance toSexpGenericSpine :: ToSexp GenericSpine where
-  toSexp SUnit        = Atom "SUnit"
-  toSexp (SArray xs)  = List (Atom "SArray"   : List.fromFoldable (map (\thk -> toSexp (thk unit)) xs))
-  toSexp (SChar c)    = List (Atom "SChar"    : toSexp c : Nil)
-  toSexp (SString s)  = List (Atom "SString"  : toSexp s : Nil)
-  toSexp (SInt i)     = List (Atom "SInt"     : toSexp i : Nil)
-  toSexp (SBoolean b) = List (Atom "SBoolean" : toSexp b : Nil)
-  toSexp (SNumber n)  = List (Atom "SNumber"  : toSexp n : Nil)
-  toSexp (SRecord r)  = List (Atom "SRecord"  : List.fromFoldable (r >>= \{recLabel, recValue} -> [Atom recLabel, toSexp (recValue unit)]))
-  toSexp (SProd c xs) = List (Atom "SProd"    : Atom c : List.fromFoldable (map (\thk -> toSexp (thk unit)) xs))
+  toSexp xs = List (Map.toUnfoldable xs >>= \(Tuple k v) -> toSexp k : toSexp v : Nil)
 
 -- | Things that S-expressions can be converted into.
 class FromSexp a where
@@ -199,6 +209,37 @@ instance fromSexpString :: FromSexp String where
   fromSexp (Atom x) = Just x
   fromSexp _ = Nothing
 
+instance fromSexpRecord_ :: (RowToList r rl, FromSexpRecord rl r) => FromSexp (Record r) where
+  fromSexp (Atom _) = Nothing
+  fromSexp (List xs) = flip Builder.build {} <$> fromSexpRecord (RLProxy :: RLProxy rl) xs
+
+class FromSexpRecord (rl :: RowList) (r :: # Type) | rl -> r where
+  fromSexpRecord :: RLProxy rl -> List Sexp -> Maybe (Builder {} (Record r))
+
+instance fromSexpRecordNil :: FromSexpRecord Nil () where
+  fromSexpRecord _ _ = Just identity
+
+instance fromSexpRecordCons
+  :: ( IsSymbol l
+     , Row.Lacks l r_
+     , Row.Cons l a r_ r
+     , FromSexp a
+     , FromSexpRecord rl_ r_
+     )
+  => FromSexpRecord (Cons l a rl_) r where
+  fromSexpRecord _ s = do
+    let l = (SProxy :: SProxy l)
+    builder <- fromSexpRecord (RLProxy :: RLProxy rl_) s
+    a <- fromSexp =<< findValueForKey (reflectSymbol l) s
+    pure (builder >>> Builder.insert l a)
+    where
+      findValueForKey key Nil = Nothing
+      findValueForKey key (x:Nil) = Nothing
+      findValueForKey key ((List vs):v:xs) = Nothing
+      findValueForKey key ((Atom k):v:xs)
+        | key == k  = Just v
+        | otherwise = findValueForKey key xs
+
 instance fromSexpArray :: (FromSexp a) => FromSexp (Array a) where
   fromSexp (List xs) = traverse fromSexp (List.toUnfoldable xs)
   fromSexp _ = Nothing
@@ -227,26 +268,6 @@ instance fromSexpEither :: (FromSexp a, FromSexp b) => FromSexp (Either a b) whe
   fromSexp (List (Atom "Right" : x : Nil)) = Right <$> fromSexp x
   fromSexp _ = Nothing
 
-instance fromSexpGenericSpine :: FromSexp GenericSpine where
-  fromSexp       (Atom "SUnit")                  = Just SUnit
-  fromSexp (List (Atom "SArray"   : xs))         =
-    SArray <<< List.toUnfoldable <<< map const <$> traverse fromSexp xs
-  fromSexp (List (Atom "SChar"    : c : Nil))    = SChar    <$> fromSexp c
-  fromSexp (List (Atom "SString"  : s : Nil))    = SString  <$> fromSexp s
-  fromSexp (List (Atom "SInt"     : i : Nil))    = SInt     <$> fromSexp i
-  fromSexp (List (Atom "SBoolean" : b : Nil))    = SBoolean <$> fromSexp b
-  fromSexp (List (Atom "SNumber"  : n : Nil))    = SNumber  <$> fromSexp n
-  fromSexp (List (Atom "SRecord"  : r))          =
-    let go acc Nil = Just (List.reverse acc)
-        go acc (Atom k : v : tail) = do
-          v' <- fromSexp v
-          go ({recLabel: k, recValue: const v'} : acc) tail
-        go acc _ = Nothing
-    in SRecord <<< List.toUnfoldable <$> go Nil r
-  fromSexp (List (Atom "SProd"    : Atom c : r)) =
-    SProd c <<< List.toUnfoldable <<< map const <$> traverse fromSexp r
-  fromSexp _ = Nothing
-
 -- | Instances must satisfy the following law:
 -- |
 -- | - Losslessness: `fromSexp (toSexp x) = Just x`
@@ -260,21 +281,13 @@ instance asSexpChar :: AsSexp Char
 instance asSexpInt :: AsSexp Int
 instance asSexpNumber :: AsSexp Number
 instance asSexpString :: AsSexp String
+instance asSexpRecord :: (RowToList r rl, ToSexpRecord rl r, FromSexpRecord rl r) => AsSexp (Record r)
 instance asSexpArray :: (AsSexp a) => AsSexp (Array a)
 instance asSexpOrdering :: AsSexp Ordering
 instance asSexpList :: (AsSexp a) => AsSexp (List a)
 instance asSexpMaybe :: (AsSexp a) => AsSexp (Maybe a)
 instance asSexpTuple :: (AsSexp a, AsSexp b) => AsSexp (Tuple a b)
 instance asSexpEither :: (AsSexp a, AsSexp b) => AsSexp (Either a b)
-instance asSexpGenericSpine :: AsSexp GenericSpine
-
--- | Convert anything to an S-expression.
-gToSexp :: forall a. (Generic a) => a -> Sexp
-gToSexp = toSpine >>> toSexp
-
--- | Convert an S-expression to anything.
-gFromSexp :: forall a. (Generic a) => Sexp -> Maybe a
-gFromSexp = fromSexp >=> fromSpine
 
 class GenericToSexp a where
   genericToSexp' :: a -> Sexp
@@ -301,18 +314,6 @@ instance genericToSexpArgsProduct :: (GenericToSexpArgs a, GenericToSexpArgs b) 
 
 instance genericToSexpArgsArgument :: (ToSexp a) => GenericToSexpArgs (Rep.Argument a) where
   genericToSexpArgs' (Rep.Argument a) = toSexp a : Nil
-
-instance genericToSexpArgsRec :: (GenericToSexpFields a) => GenericToSexpArgs (Rep.Rec a) where
-  genericToSexpArgs' (Rep.Rec a) = List (genericToSexpFields' a) : Nil
-
-class GenericToSexpFields a where
-  genericToSexpFields' :: a -> List Sexp
-
-instance genericToSexpFieldsProduct :: (GenericToSexpFields a, GenericToSexpFields b) => GenericToSexpFields (Rep.Product a b) where
-  genericToSexpFields' (Rep.Product a b) = genericToSexpFields' a <> genericToSexpFields' b
-
-instance genericToSexpFieldsField :: (IsSymbol n, ToSexp a) => GenericToSexpFields (Rep.Field n a) where
-  genericToSexpFields' (Rep.Field a) = Atom (reflectSymbol (SProxy :: SProxy n)) : toSexp a : Nil
 
 class GenericFromSexp a where
   genericFromSexp' :: Sexp -> Maybe a
@@ -344,27 +345,10 @@ instance genericFromSexpArgsArgument :: (FromSexp a) => GenericFromSexpArgs (Rep
   genericFromSexpArgs' (a : Nil) = Rep.Argument <$> fromSexp a
   genericFromSexpArgs' _ = Nothing
 
-instance genericFromSexpArgsRec :: (GenericFromSexpFields a) => GenericFromSexpArgs (Rep.Rec a) where
-  genericFromSexpArgs' (List a : Nil) = Rep.Rec <$> genericFromSexpFields' a
-  genericFromSexpArgs' _ = Nothing
-
-class GenericFromSexpFields a where
-  genericFromSexpFields' :: List Sexp -> Maybe a
-
-instance genericFromSexpFieldsProduct :: (GenericFromSexpFields a, GenericFromSexpFields b) => GenericFromSexpFields (Rep.Product a b) where
-  genericFromSexpFields' (a : b) =
-    Rep.Product <$> genericFromSexpFields' (a : Nil) <*> genericFromSexpFields' b
-  genericFromSexpFields' Nil = Nothing
-
-instance genericFromSexpFieldsField :: (IsSymbol n, FromSexp a) => GenericFromSexpFields (Rep.Field n a) where
-  genericFromSexpFields' (Atom n : a : Nil) | n == reflectSymbol (SProxy :: SProxy n) =
-    Rep.Field <$> fromSexp a
-  genericFromSexpFields' _ = Nothing
-
 -- | Convert anything to an S-expression.
-genericToSexp :: forall a r. (Rep.Generic a r, GenericToSexp r) => a -> Sexp
+genericToSexp :: forall a r. Rep.Generic a r => GenericToSexp r => a -> Sexp
 genericToSexp = Rep.from >>> genericToSexp'
 
 -- | Convert an S-expression to anything.
-genericFromSexp :: forall a r. (Rep.Generic a r, GenericFromSexp r) => Sexp -> Maybe a
+genericFromSexp :: forall a r. Rep.Generic a r => GenericFromSexp r => Sexp -> Maybe a
 genericFromSexp = genericFromSexp' >>> map Rep.to
